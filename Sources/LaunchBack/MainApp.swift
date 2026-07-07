@@ -1,0 +1,94 @@
+import AppKit
+import SwiftUI
+
+@main
+struct LaunchBackApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        // No visible scene of our own — everything is driven by AppDelegate
+        // through LaunchpadOverlayWindow. Settings{} keeps SwiftUI's App
+        // lifecycle happy without creating a stray window.
+        Settings { EmptyView() }
+    }
+}
+
+/// Ties together app discovery, the overlay window(s), and the global
+/// hotkey, and makes a second launch of the bundle act as a toggle.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var overlayWindow: LaunchpadOverlayWindow?
+    private var hotkeyManager: HotkeyManager?
+    private var isVisible = false
+    private let appStore = AppStore()
+
+    // Apple's own (now-vestigial) Launchpad.app shim toggles by posting this
+    // exact distributed notification — observed via `strings` on
+    // /System/Applications/Launchpad.app/Contents/MacOS/Launchpad. Listening
+    // for it too means any leftover system trigger for "toggle Launchpad"
+    // (an F4 remap, `tell application "Launchpad" to activate`, etc.) also
+    // opens LaunchBack, at no cost if nothing ever posts it.
+    private static let legacyLaunchpadToggleName = Notification.Name("com.apple.launchpad.toggle")
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory) // menu-bar-less background utility
+
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleDistributedToggle),
+            name: Self.legacyLaunchpadToggleName,
+            object: nil
+        )
+
+        hotkeyManager = HotkeyManager { [weak self] in self?.toggle() }
+
+        // Show instantly — don't block the overlay's first appearance on a
+        // full filesystem scan. The grid populates as soon as the scan
+        // (kicked off inside `show()`) completes.
+        show()
+    }
+
+    // `LSMultipleInstancesProhibited` in Info.plist is what makes this fire:
+    // it tells Launch Services never to spawn a second process for this
+    // bundle ID, and instead call this on the already-running instance
+    // whenever the user tries to open the app again (double-click, Dock
+    // click, `open` from Terminal). Without that key, this delegate method
+    // is simply never invoked — which is exactly why re-opening used to do
+    // nothing until the app was quit first.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        toggle()
+        return true
+    }
+
+    @objc private func handleDistributedToggle() {
+        toggle()
+    }
+
+    private func toggle() {
+        isVisible ? hide() : show()
+    }
+
+    private func show() {
+        guard !isVisible, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+
+        let window = LaunchpadOverlayWindow(screen: screen)
+        window.show(with: GridView(store: appStore, onDismiss: { [weak self] in self?.hide() }))
+        overlayWindow = window
+        isVisible = true
+
+        // (Re)scan in the background — first call populates the empty
+        // store as fast as possible, later calls just pick up any apps
+        // installed/removed since last time. The grid updates live either
+        // way since it's bound to `appStore`.
+        Task { [appStore] in
+            let apps = await AppQueryEngine.shared.scanApplications()
+            appStore.apps = apps
+        }
+    }
+
+    private func hide() {
+        overlayWindow?.dismiss()
+        overlayWindow = nil
+        isVisible = false
+    }
+}
