@@ -51,6 +51,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // anything. It'll just render an empty grid for a moment if the
         // very first Spotlight gather hasn't completed yet.
         show()
+
+        // Only matters for procedural/animated wallpapers with no backing
+        // image file (see `LaunchpadOverlayWindow.liveDesktopSnapshot`).
+        // `CGRequestScreenCaptureAccess()` blocks on its system prompt, so
+        // it's deferred until just after the very first `show()` instead of
+        // sitting ahead of it — the first appearance always uses whatever's
+        // already available (falling back to a live blur if needed), and if
+        // the user grants access, later toggles pick up the accurate
+        // snapshot automatically.
+        DispatchQueue.main.async {
+            CGRequestScreenCaptureAccess()
+        }
     }
 
     // `LSMultipleInstancesProhibited` in Info.plist is what makes this fire:

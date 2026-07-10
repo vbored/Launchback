@@ -16,20 +16,26 @@ struct GridView: View {
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
 
+    // `pages` used to be a computed property, re-filtering and re-chunking
+    // the entire app list on *every* SwiftUI body evaluation — which fires
+    // on every hover event and every scroll-position tick while paging.
+    // Redoing that work dozens of times a second while swiping was the
+    // actual cause of the slow/glitchy transitions: recomputed here once,
+    // only when the underlying data (`store.apps`, `searchText`) actually
+    // changes, instead of on every render.
+    @State private var pages: [[AppInfo]] = []
+
     private let columns = 7
     private let rows = 5
 
-    private var filteredApps: [AppInfo] {
-        guard !searchText.isEmpty else { return store.apps }
-        return store.apps.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-    }
-
-    private var pages: [[AppInfo]] {
-        let perPage = max(columns * rows, 1)
-        return stride(from: 0, to: filteredApps.count, by: perPage).map {
-            Array(filteredApps[$0..<min($0 + perPage, filteredApps.count)])
-        }
-    }
+    // SwiftUI's plain `withAnimation { }` uses the implicit default spring
+    // (~0.55s, fairly loose), which reads as noticeably sluggish next to
+    // classic Launchpad's snappy page-flip — and next to the native
+    // trackpad-swipe paging above, which uses its own quick system physics.
+    // Using the same explicit, quick curve everywhere a page change is
+    // triggered programmatically (mouse-drag release, page-dot tap) keeps
+    // every path feeling consistent and fast.
+    fileprivate static let pageChangeAnimation: Animation = .easeOut(duration: 0.28)
 
     var body: some View {
         ZStack {
@@ -43,11 +49,39 @@ struct GridView: View {
                     .padding(.top, 28)
 
                 GeometryReader { geo in
+                    // Classic Launchpad's centered, "framed" look (content at
+                    // ~68% of screen width, matched off a reference
+                    // screenshot) used to be done with horizontal padding
+                    // applied *inside* each page. That put each page's own
+                    // margin inside its own scroll-content slot, so
+                    // mid-transition — with two adjacent pages each partially
+                    // visible — both pages' margins landed in the middle of
+                    // the screen at once: a ~32%-wide blank gap between the
+                    // outgoing and incoming icons (confirmed frame-by-frame
+                    // in a user-provided recording). Constraining the
+                    // ScrollView itself to that 68% width instead, and
+                    // sizing pages to fill it exactly with zero padding,
+                    // moves the margin outside the scrollable area entirely
+                    // — it's just static background on either side that
+                    // never moves, and adjacent pages slide directly flush
+                    // against each other with no gap.
+                    let contentWidth = geo.size.width * 0.68
+
                     VStack(spacing: 20) {
                         ScrollView(.horizontal) {
-                            LazyHStack(spacing: 0) {
+                            // Plain `HStack`, not `LazyHStack`: a Mac's page
+                            // count is small (even a heavily-loaded machine
+                            // rarely exceeds 8-10 pages of 35 apps each), and
+                            // laziness was costing more than it saved —
+                            // pages just outside the lazy-load window could
+                            // still be settling their layout while a fast
+                            // swipe reached them, which is what produced the
+                            // brief "two pages' icons visible at once"
+                            // glitch. Laying out every page up front avoids
+                            // that entirely, at negligible memory cost.
+                            HStack(spacing: 0) {
                                 ForEach(Array(pages.enumerated()), id: \.offset) { index, pageApps in
-                                    pageGrid(pageApps, containerWidth: geo.size.width, containerHeight: geo.size.height)
+                                    pageGrid(pageApps, containerWidth: contentWidth, containerHeight: geo.size.height)
                                         .containerRelativeFrame(.horizontal)
                                         .id(index)
                                 }
@@ -55,40 +89,62 @@ struct GridView: View {
                             .scrollTargetLayout()
                             .background(ScrollbarHider())
                         }
+                        .frame(width: contentWidth)
                         .scrollTargetBehavior(.paging)
                         .scrollPosition(id: $currentPage)
                         .scrollIndicators(.hidden)
                         .scrollDisabled(pages.count <= 1)
                         // Trackpad two-finger swipe already works above for
-                        // free — that's a scroll-wheel event, which
-                        // `ScrollView` handles natively. A plain mouse drag
-                        // is a different event type AppKit doesn't route to
-                        // scroll views at all, so without this, swiping with
-                        // a mouse silently does nothing. `simultaneousGesture`
-                        // (not `gesture`) so it only *adds* page-flip-on-
-                        // release behavior instead of stealing the scroll
-                        // view's own trackpad handling.
-                        .simultaneousGesture(
-                            DragGesture(minimumDistance: 20)
-                                .onEnded { value in
-                                    let threshold: CGFloat = 80
-                                    let page = currentPage ?? 0
-                                    if value.translation.width < -threshold {
-                                        withAnimation { currentPage = min(page + 1, pages.count - 1) }
-                                    } else if value.translation.width > threshold {
-                                        withAnimation { currentPage = max(page - 1, 0) }
-                                    }
+                        // free via the ScrollView's native paging. Plain
+                        // mouse click-drag needs separate handling since
+                        // AppKit doesn't route that to scroll views at all —
+                        // but a SwiftUI `DragGesture` composed alongside the
+                        // ScrollView (via `.simultaneousGesture`) turned out
+                        // to *also* intermittently respond to trackpad pans,
+                        // racing the ScrollView's own native snap decision
+                        // and producing exactly the "pages overlapping"
+                        // glitch reported during testing — two independent
+                        // systems both animating to a (sometimes different)
+                        // final page. A raw local event monitor watching
+                        // only genuine `leftMouseDown`/`leftMouseUp` sees
+                        // nothing when a trackpad is swiped (that arrives as
+                        // `.scrollWheel` events instead), so it can't
+                        // conflict by construction.
+                        .background(
+                            MouseDragPager { translation in
+                                let threshold: CGFloat = 80
+                                let page = currentPage ?? 0
+                                if translation < -threshold {
+                                    withAnimation(Self.pageChangeAnimation) { currentPage = min(page + 1, pages.count - 1) }
+                                } else if translation > threshold {
+                                    withAnimation(Self.pageChangeAnimation) { currentPage = max(page - 1, 0) }
                                 }
+                            }
                         )
 
                         if pages.count > 1 {
                             PageIndicator(count: pages.count, currentPage: $currentPage)
                         }
                     }
+                    // Constraining the ScrollView to `contentWidth` makes it
+                    // (and this whole VStack, which sizes to its widest
+                    // child) narrower than the GeometryReader itself — and
+                    // GeometryReader places a narrower child at its
+                    // top-leading corner, not centered, which left all the
+                    // now-unused width as blank space on the right instead
+                    // of splitting it evenly on both sides. Explicitly
+                    // filling and centering within the GeometryReader's full
+                    // width restores the centered, framed look.
+                    .frame(maxWidth: .infinity)
                 }
             }
         }
-        .onChange(of: searchText) { currentPage = 0 }
+        .onAppear { recomputePages() }
+        .onChange(of: store.apps) { recomputePages() }
+        .onChange(of: searchText) {
+            currentPage = 0
+            recomputePages()
+        }
         .onExitCommand {
             if !searchText.isEmpty {
                 searchText = ""
@@ -98,22 +154,42 @@ struct GridView: View {
         }
     }
 
+    private func recomputePages() {
+        let filtered = searchText.isEmpty
+            ? store.apps
+            : store.apps.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        let perPage = max(columns * rows, 1)
+        let newPages = stride(from: 0, to: filtered.count, by: perPage).map {
+            Array(filtered[$0..<min($0 + perPage, filtered.count)])
+        }
+        // The live app-list monitor can update `store.apps` several times in
+        // quick succession while it's still settling (initial gather, then
+        // follow-up updates) — each one reshuffles which app lands on which
+        // page. Without this, SwiftUI implicitly cross-fades the `ForEach`
+        // between the old and new page contents, which for a brief moment
+        // visibly overlapped two different apps' labels at the same grid
+        // position. Disabling animation for this specific assignment makes
+        // it a clean, instant swap instead.
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            pages = newPages
+        }
+    }
+
     /// Icons scale with the available cell width instead of a fixed size,
     /// so they fill their grid cell the way classic Launchpad's do rather
     /// than looking small and lost on wide/high-column-count screens.
+    ///
+    /// `containerWidth` here is already the narrowed, framed content width
+    /// (the caller constrains the ScrollView itself to ~68% of the screen)
+    /// — this just fills it edge to edge, with no additional margin of its
+    /// own, so adjacent pages sit flush against each other with no gap
+    /// during a swipe.
     @ViewBuilder
     private func pageGrid(_ pageApps: [AppInfo], containerWidth: CGFloat, containerHeight: CGFloat) -> some View {
-        // Classic Launchpad doesn't stretch icons to fill whatever width the
-        // display happens to have — icon size stays fixed and comfortable,
-        // and the grid is simply centered, leaving visible margin on both
-        // sides on wider screens rather than growing icons to eat it up.
-        // 68% (measured directly off a real Launchpad screenshot: content
-        // spanned ~69% of screen width) keeps that centered, "framed" look.
-        // The old 1500pt cap here was cutting that back down to ~55% on a
-        // typical 2560pt-wide display — removed.
         let horizontalSpacing: CGFloat = 32
-        let contentWidth = containerWidth * 0.68
-        let cellWidth = (contentWidth - horizontalSpacing * CGFloat(columns - 1)) / CGFloat(columns)
+        let cellWidth = (containerWidth - horizontalSpacing * CGFloat(columns - 1)) / CGFloat(columns)
         // 0.45 undershot next to the reference once rendered — bumped to
         // 0.55, with the cap raised to match so it doesn't get clipped back
         // down on typical screen widths.
@@ -159,7 +235,6 @@ struct GridView: View {
                 .onTapGesture { launch(app) }
             }
         }
-        .frame(width: contentWidth)
         .padding(.top, topInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .contentShape(Rectangle())
@@ -214,6 +289,69 @@ private struct SearchField: View {
     }
 }
 
+/// Detects genuine mouse click-drag-release sequences via a raw local event
+/// monitor rather than SwiftUI's `DragGesture`. Trackpad two-finger swipes
+/// arrive as `.scrollWheel` events, never `.leftMouseDown`/`.leftMouseUp`, so
+/// this can't ever fire for one — unlike `DragGesture` composed alongside a
+/// `ScrollView`, which was found to sometimes respond to trackpad pans too,
+/// racing the ScrollView's own native paging. The monitor only observes
+/// events (always returning them unmodified), so it never blocks normal
+/// clicks on icons, the search field, or page dots.
+private struct MouseDragPager: NSViewRepresentable {
+    let onSwipe: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        context.coordinator.install()
+        return NSView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onSwipe: onSwipe)
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class Coordinator {
+        private let onSwipe: (CGFloat) -> Void
+        private var monitor: Any?
+        private var startPoint: NSPoint?
+
+        init(onSwipe: @escaping (CGFloat) -> Void) {
+            self.onSwipe = onSwipe
+        }
+
+        func install() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+                guard let self else { return event }
+                switch event.type {
+                case .leftMouseDown:
+                    self.startPoint = event.locationInWindow
+                case .leftMouseUp:
+                    if let start = self.startPoint {
+                        self.onSwipe(event.locationInWindow.x - start.x)
+                    }
+                    self.startPoint = nil
+                default:
+                    break
+                }
+                return event
+            }
+        }
+
+        func uninstall() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+            }
+            monitor = nil
+        }
+    }
+}
+
 /// `.scrollIndicators(.hidden)` only suppresses the modern overlay
 /// scroller; when the system-wide "Show scroll bars: Always" preference is
 /// on, AppKit falls back to a legacy `NSScroller` that ignores it. This
@@ -248,7 +386,7 @@ private struct PageIndicator: View {
                     .fill(index == (currentPage ?? 0) ? Color.white : Color.white.opacity(0.35))
                     .frame(width: 7, height: 7)
                     .onTapGesture {
-                        withAnimation { currentPage = index }
+                        withAnimation(GridView.pageChangeAnimation) { currentPage = index }
                     }
             }
         }
