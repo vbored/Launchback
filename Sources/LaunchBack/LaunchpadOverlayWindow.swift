@@ -40,13 +40,13 @@ final class LaunchpadOverlayWindow: NSWindow {
         ignoresMouseEvents = false
         animationBehavior = .none
 
-        // `.fullScreenUI` is the "correct" material on paper, but at this
-        // window's very high level (`.mainMenu + 1`) it can composite as a
-        // flatter, more opaque fill instead of a real see-through blur.
-        // `.hudWindow` stays reliably translucent regardless of window
-        // level, which is what gives the classic frosted-glass Launchpad
-        // look instead of a solid dark rectangle.
-        blurView.material = .hudWindow
+        // `.hudWindow` is Apple's dark HUD-panel material — always dark and
+        // desaturated by design, regardless of the actual desktop wallpaper,
+        // which is why the overlay looked washed-out gray instead of
+        // showing the wallpaper's real colors through the blur. `.fullScreenUI`
+        // is the material Mission Control/Launchpad themselves use for
+        // exactly this — showing a blurred, still-colorful wallpaper.
+        blurView.material = .fullScreenUI
         blurView.blendingMode = .behindWindow
         blurView.state = .active
         blurView.frame = screen.frame

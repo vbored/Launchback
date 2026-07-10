@@ -42,9 +42,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hotkeyManager = HotkeyManager { [weak self] in self?.toggle() }
 
-        // Show instantly — don't block the overlay's first appearance on a
-        // full filesystem scan. The grid populates as soon as the scan
-        // (kicked off inside `show()`) completes.
+        // Starts a persistent Spotlight monitor once; from here on
+        // `appStore.apps` stays in sync with installs/removals on its own,
+        // so `show()` never needs to trigger a scan itself.
+        AppQueryEngine.shared.startMonitoring(store: appStore)
+
+        // Show instantly — don't block the overlay's first appearance on
+        // anything. It'll just render an empty grid for a moment if the
+        // very first Spotlight gather hasn't completed yet.
         show()
     }
 
@@ -75,15 +80,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.show(with: GridView(store: appStore, onDismiss: { [weak self] in self?.hide() }))
         overlayWindow = window
         isVisible = true
-
-        // (Re)scan in the background — first call populates the empty
-        // store as fast as possible, later calls just pick up any apps
-        // installed/removed since last time. The grid updates live either
-        // way since it's bound to `appStore`.
-        Task { [appStore] in
-            let apps = await AppQueryEngine.shared.scanApplications()
-            appStore.apps = apps
-        }
     }
 
     private func hide() {

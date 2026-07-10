@@ -17,10 +17,7 @@ struct GridView: View {
     @FocusState private var searchFocused: Bool
 
     private let columns = 7
-
-    private var rows: Int {
-        (NSScreen.main?.frame.height ?? 900) < 900 ? 4 : 5
-    }
+    private let rows = 5
 
     private var filteredApps: [AppInfo] {
         guard !searchText.isEmpty else { return store.apps }
@@ -50,7 +47,7 @@ struct GridView: View {
                         ScrollView(.horizontal) {
                             LazyHStack(spacing: 0) {
                                 ForEach(Array(pages.enumerated()), id: \.offset) { index, pageApps in
-                                    pageGrid(pageApps, containerWidth: geo.size.width)
+                                    pageGrid(pageApps, containerWidth: geo.size.width, containerHeight: geo.size.height)
                                         .containerRelativeFrame(.horizontal)
                                         .id(index)
                                 }
@@ -62,12 +59,6 @@ struct GridView: View {
                         .scrollPosition(id: $currentPage)
                         .scrollIndicators(.hidden)
                         .scrollDisabled(pages.count <= 1)
-                        // The 80pt "framed" inset from the screen edge only
-                        // belongs at the very start/end of the whole strip,
-                        // not on every page — contentMargins applies it
-                        // there. (See pageGrid's own comment for why it
-                        // can't live on each page instead.)
-                        .contentMargins(.horizontal, 64, for: .scrollContent)
                         // Trackpad two-finger swipe already works above for
                         // free — that's a scroll-wheel event, which
                         // `ScrollView` handles natively. A plain mouse drag
@@ -111,24 +102,37 @@ struct GridView: View {
     /// so they fill their grid cell the way classic Launchpad's do rather
     /// than looking small and lost on wide/high-column-count screens.
     @ViewBuilder
-    private func pageGrid(_ pageApps: [AppInfo], containerWidth: CGFloat) -> some View {
-        // Each page is its own view sitting directly next to the next one
-        // in the `LazyHStack` — any horizontal padding here gets applied on
-        // *both* sides of *every* page, so at a page boundary it stacks
-        // (this page's trailing padding + the next page's leading padding),
-        // producing an oversized dead gap mid-swipe instead of a smooth
-        // continuous strip. Using half of the column spacing here means
-        // adjacent pages' padding sums to exactly one column gap (32pt) —
-        // indistinguishable from the spacing between any two columns in the
-        // same page. The larger 80pt inset from the true screen edge comes
-        // from `.contentMargins` on the ScrollView instead, which (unlike
-        // per-page padding) only applies once, at the very start and end of
-        // the whole scrollable strip.
-        let horizontalPadding: CGFloat = 16
-        let spacing: CGFloat = 32
-        let availableWidth = containerWidth - horizontalPadding * 2 - spacing * CGFloat(columns - 1)
-        let cellWidth = availableWidth / CGFloat(columns)
-        let iconSize = min(max(cellWidth * 0.64, 64), 132)
+    private func pageGrid(_ pageApps: [AppInfo], containerWidth: CGFloat, containerHeight: CGFloat) -> some View {
+        // Classic Launchpad doesn't stretch icons to fill whatever width the
+        // display happens to have — icon size stays fixed and comfortable,
+        // and the grid is simply centered, leaving visible margin on both
+        // sides on wider screens rather than growing icons to eat it up.
+        // 68% (measured directly off a real Launchpad screenshot: content
+        // spanned ~69% of screen width) keeps that centered, "framed" look.
+        // The old 1500pt cap here was cutting that back down to ~55% on a
+        // typical 2560pt-wide display — removed.
+        let horizontalSpacing: CGFloat = 32
+        let contentWidth = containerWidth * 0.68
+        let cellWidth = (contentWidth - horizontalSpacing * CGFloat(columns - 1)) / CGFloat(columns)
+        // 0.45 undershot next to the reference once rendered — bumped to
+        // 0.55, with the cap raised to match so it doesn't get clipped back
+        // down on typical screen widths.
+        let iconSize = min(max(cellWidth * 0.55, 64), 140)
+
+        // Row spacing was a fixed 32pt regardless of available height, so 5
+        // rows never filled the space — everything stayed top-aligned with
+        // a big dead gap before the page dots instead of extending closer
+        // to them like real Launchpad's. Deriving it from `containerHeight`
+        // the same way column width is derived from `containerWidth` makes
+        // the 5 rows actually fill the vertical space.
+        let topInset: CGFloat = 40
+        let bottomReserve: CGFloat = 48 // room for the page-dot row below
+        let labelHeight: CGFloat = 16
+        let iconLabelGap: CGFloat = 8
+        let rowContentHeight = iconSize + iconLabelGap + labelHeight
+        let availableForRows = max(containerHeight - topInset - bottomReserve, rowContentHeight * CGFloat(rows))
+        let rowPitch = availableForRows / CGFloat(rows)
+        let verticalSpacing = max(rowPitch - rowContentHeight, horizontalSpacing)
 
         // The tap-to-dismiss catcher lives here (on the grid content) and
         // not on the ScrollView above: stacking a plain `.onTapGesture`
@@ -140,13 +144,14 @@ struct GridView: View {
         // and still covers the gaps between icons — the vast majority of
         // the "empty" area a user would actually click.
         LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: spacing), count: columns),
-            spacing: 32
+            columns: Array(repeating: GridItem(.flexible(), spacing: horizontalSpacing), count: columns),
+            spacing: verticalSpacing
         ) {
             ForEach(pageApps) { app in
                 AppIconView(
                     app: app,
                     iconSize: iconSize,
+                    labelWidth: cellWidth,
                     isHovered: hoveredID == app.id,
                     isLaunching: launchingID == app.id
                 )
@@ -154,8 +159,8 @@ struct GridView: View {
                 .onTapGesture { launch(app) }
             }
         }
-        .padding(.horizontal, horizontalPadding)
-        .padding(.top, 40)
+        .frame(width: contentWidth)
+        .padding(.top, topInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .contentShape(Rectangle())
         .onTapGesture(perform: onDismiss)
@@ -254,6 +259,7 @@ private struct PageIndicator: View {
 private struct AppIconView: View {
     let app: AppInfo
     let iconSize: CGFloat
+    let labelWidth: CGFloat
     let isHovered: Bool
     let isLaunching: Bool
 
@@ -273,7 +279,7 @@ private struct AppIconView: View {
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(width: iconSize + 24)
+                .frame(width: labelWidth)
                 .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
         }
         .contentShape(Rectangle())
