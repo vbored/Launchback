@@ -19,7 +19,11 @@ To enable it:
 Open System Settings → Privacy & Security → Screen Recording
 Turn on the toggle for LaunchBack
 Quit and reopen LaunchBack (macOS requires a relaunch for this permission to take effect)
+
+
 Without Persion
 ![alt text](https://github.com/vbored/Launchback/blob/main/screenshot.png)
 
-with permission: 
+With permission: 
+
+![alt text](https://github.com/vbored/Launchback/blob/main/Screenshot1.png)
