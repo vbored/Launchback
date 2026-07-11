@@ -90,7 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func show() {
-        guard !isVisible, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        guard !isVisible, let screen = Self.targetScreen() else { return }
 
         // The exact same closure goes to both the SwiftUI content (tap to
         // dismiss, onExitCommand) and the window itself (its own Escape-key
@@ -108,5 +108,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayWindow?.dismiss()
         overlayWindow = nil
         isVisible = false
+    }
+
+    /// Every screen dimension the overlay uses (window frame, grid layout,
+    /// icon sizing, wallpaper render target) already derives dynamically
+    /// from whichever `NSScreen` gets passed in here — there's no hardcoded
+    /// resolution anywhere, so this alone is what determines "does the app
+    /// correctly fit the machine it's running on."
+    ///
+    /// `NSScreen.main` specifically means "the screen containing the key
+    /// window" — and this app has no key window almost all the time (it's a
+    /// background accessory app that only briefly becomes key while the
+    /// grid itself is open), so it's `nil` on every fresh launch and every
+    /// toggle-open, silently falling through to `NSScreen.screens.first`.
+    /// That's not "the current screen" by any real definition — it's just
+    /// array order, which on a multi-monitor setup doesn't necessarily
+    /// match the display the user is actually sitting in front of.
+    /// Finding whichever screen contains the mouse cursor instead matches
+    /// how macOS's own full-screen overlays (Mission Control, Launchpad)
+    /// behave — opening on the display you're actively using — with
+    /// `.main`/`.screens.first` as fallbacks for the (rare) case the cursor
+    /// position can't be resolved to a screen at all.
+    private static func targetScreen() -> NSScreen? {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first { $0.frame.contains(mouseLocation) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
     }
 }

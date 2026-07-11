@@ -26,6 +26,7 @@ final class WallpaperBackgroundCache {
     private let ciContext = CIContext(options: nil)
     private var lastPrewarmedScreen: NSScreen?
     private var wallpaperChangeSource: DispatchSourceFileSystemObject?
+    private var pendingChangeWorkItem: DispatchWorkItem?
 
     private static let wallpaperStorePath = NSString(
         string: "~/Library/Application Support/com.apple.wallpaper/Store/Index.plist"
@@ -61,12 +62,28 @@ final class WallpaperBackgroundCache {
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
         source.setEventHandler { [weak self] in
             guard let self else { return }
-            self.cachedImage = nil
             self.wallpaperChangeSource?.cancel()
             self.watchWallpaperStore()
-            if let screen = self.lastPrewarmedScreen {
-                self.prewarm(for: screen)
+
+            // A single logical wallpaper change can touch this file more
+            // than once in quick succession (e.g. a temp-file write
+            // followed by the atomic rename over the original) — without
+            // coalescing, each one independently invalidated the cache and
+            // kicked off its own full render, doubling up on an already
+            // expensive-ish operation for no visual benefit (confirmed via
+            // `vmmap`: a real run showed two full sets of blur-pipeline
+            // buffers alive at once). Debouncing collapses a burst of
+            // events into exactly one re-render.
+            self.pendingChangeWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.cachedImage = nil
+                if let screen = self.lastPrewarmedScreen {
+                    self.prewarm(for: screen)
+                }
             }
+            self.pendingChangeWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
         }
         source.setCancelHandler { close(fd) }
         source.resume()
@@ -93,11 +110,20 @@ final class WallpaperBackgroundCache {
         // thread, before hopping off — only the actual Core Image/Core
         // Graphics number-crunching below needs to happen in the background.
         let screenFrame = screen.frame
+        let targetPixelSize = CGSize(
+            width: screenFrame.width * screen.backingScaleFactor,
+            height: screenFrame.height * screen.backingScaleFactor
+        )
         let wallpaperURL = NSWorkspace.shared.desktopImageURL(for: screen)
         let context = ciContext
 
         Task.detached(priority: .userInitiated) {
-            let image = Self.renderBackground(wallpaperURL: wallpaperURL, screenFrame: screenFrame, context: context)
+            let image = Self.renderBackground(
+                wallpaperURL: wallpaperURL,
+                screenFrame: screenFrame,
+                targetPixelSize: targetPixelSize,
+                context: context
+            )
             await MainActor.run {
                 self.isComputing = false
                 guard let image else { return }
@@ -109,12 +135,17 @@ final class WallpaperBackgroundCache {
 
     // MARK: - Rendering (runs off the main thread)
 
-    private nonisolated static func renderBackground(wallpaperURL: URL?, screenFrame: NSRect, context: CIContext) -> NSImage? {
-        if let ciImage = staticWallpaperImage(from: wallpaperURL) {
-            return blurredAndTinted(ciImage, context: context)
+    private nonisolated static func renderBackground(
+        wallpaperURL: URL?,
+        screenFrame: NSRect,
+        targetPixelSize: CGSize,
+        context: CIContext
+    ) -> NSImage? {
+        if let ciImage = staticWallpaperImage(from: wallpaperURL, targetPixelSize: targetPixelSize) {
+            return blurredAndTinted(ciImage, targetPixelSize: targetPixelSize, context: context)
         }
         if let ciImage = liveDesktopSnapshotImage(screenFrame: screenFrame) {
-            return blurredAndTinted(ciImage, context: context)
+            return blurredAndTinted(ciImage, targetPixelSize: targetPixelSize, context: context)
         }
         return nil
     }
@@ -130,7 +161,7 @@ final class WallpaperBackgroundCache {
     /// just returns a generic system fallback file in that case, which
     /// would render the wrong picture entirely, so that's treated the same
     /// as "no file available."
-    private nonisolated static func staticWallpaperImage(from url: URL?) -> CIImage? {
+    private nonisolated static func staticWallpaperImage(from url: URL?, targetPixelSize: CGSize) -> CIImage? {
         guard let url, url.lastPathComponent != "DefaultDesktop.heic" else { return nil }
 
         // Video-based dynamic wallpapers (macOS's "Aerial"-style landscapes,
@@ -146,7 +177,32 @@ final class WallpaperBackgroundCache {
             return CIImage(cgImage: cgImage)
         }
 
-        return CIImage(contentsOf: url)
+        // Wallpaper source files can be dramatically higher resolution than
+        // the screen (observed: a 6016×6016 source backing a 2560×1440
+        // display — 25× more pixels than ever get shown). `CIImage(
+        // contentsOf:)` decodes the file at full resolution regardless, and
+        // it turns out downscaling *after* that with `.transformed(by:)`
+        // doesn't avoid the cost — Core Image's render graph still
+        // materializes the full-size source internally before applying the
+        // transform (confirmed via `vmmap`: a 138MB IOSurface at the full
+        // 6016×6016 size was still allocated even with a scale-down
+        // transform applied downstream). `CGImageSourceCreateThumbnailAtIndex`
+        // decodes and downsamples in one step instead — for a tiled format
+        // like HEIC it never materializes the full-resolution bitmap at
+        // all, which is the only way to actually avoid paying for those
+        // pixels rather than just discarding them after the fact.
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let maxPixelSize = max(targetPixelSize.width, targetPixelSize.height)
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return CIImage(contentsOf: url)
+        }
+        return CIImage(cgImage: cgImage)
     }
 
     /// Grabs a real screenshot of just the desktop-picture layer — the
@@ -181,11 +237,34 @@ final class WallpaperBackgroundCache {
         return CIImage(cgImage: cgImage)
     }
 
-    private nonisolated static func blurredAndTinted(_ ciImage: CIImage, context: CIContext) -> NSImage? {
+    private nonisolated static func blurredAndTinted(_ ciImage: CIImage, targetPixelSize: CGSize, context: CIContext) -> NSImage? {
+        // Wallpaper *source* images can be dramatically higher resolution
+        // than the actual screen — one observed case was a 6016×6016 source
+        // for a 2560×1440 display, over 25× more pixels than ever get shown.
+        // Blurring destroys fine detail anyway, so processing at full source
+        // resolution bought nothing but cost a lot: `vmmap` on a real run
+        // showed Core Image allocating dozens of IOSurface buffers up to
+        // 138MB each for that single blur, pushing the app's resident memory
+        // over 800MB. Downscaling to the screen's actual pixel size *before*
+        // blurring — still comfortably more resolution than a heavily
+        // blurred, blended-with-content backdrop needs — cuts that by
+        // roughly the same 25× factor, before any of the actually-expensive
+        // blur work happens.
+        // Only ever scales *down* (never up, for a source already at or
+        // below screen resolution — e.g. the live-snapshot path, which is
+        // already close to native screen pixels) — and the blur radius
+        // scales down by the same factor, so the on-screen blur strength
+        // looks the same as it always did rather than suddenly changing for
+        // whichever path happens to need downscaling this time.
+        let scale = min(min(targetPixelSize.width / ciImage.extent.width, targetPixelSize.height / ciImage.extent.height), 1)
+        let downscaled = scale < 1
+            ? ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            : ciImage
+
         let blur = CIFilter.gaussianBlur()
-        blur.inputImage = ciImage.clampedToExtent()
-        blur.radius = 90
-        guard let blurred = blur.outputImage?.cropped(to: ciImage.extent) else { return nil }
+        blur.inputImage = downscaled.clampedToExtent()
+        blur.radius = Float(90 * scale)
+        guard let blurred = blur.outputImage?.cropped(to: downscaled.extent) else { return nil }
 
         let tint = CIFilter.colorControls()
         tint.inputImage = blurred
@@ -198,7 +277,7 @@ final class WallpaperBackgroundCache {
         // what actually does the expensive work now, off the main thread,
         // instead of leaving it to fire the first time an `NSImageView`
         // draws it later on the main thread.
-        guard let cgImage = context.createCGImage(finalImage, from: ciImage.extent) else { return nil }
+        guard let cgImage = context.createCGImage(finalImage, from: downscaled.extent) else { return nil }
         return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
 }
