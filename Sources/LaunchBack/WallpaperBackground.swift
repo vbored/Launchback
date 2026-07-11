@@ -24,18 +24,53 @@ final class WallpaperBackgroundCache {
     private var cachedImage: NSImage?
     private var isComputing = false
     private let ciContext = CIContext(options: nil)
+    private var lastPrewarmedScreen: NSScreen?
+    private var wallpaperChangeSource: DispatchSourceFileSystemObject?
+
+    private static let wallpaperStorePath = NSString(
+        string: "~/Library/Application Support/com.apple.wallpaper/Store/Index.plist"
+    ).expandingTildeInPath
 
     private init() {
-        // Posted by WallpaperAgent when the desktop picture changes, so a
-        // long-running LaunchBack session doesn't keep showing a stale
-        // background after the user picks a new wallpaper.
-        DistributedNotificationCenter.default().addObserver(
-            forName: Notification.Name("com.apple.desktopBackgroundChanged"),
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.cachedImage = nil
+        // A long-running LaunchBack session should notice when the wallpaper
+        // changes instead of keeping a stale cached background until the
+        // app is quit and relaunched. There's no *documented* public
+        // notification for this — an earlier version of this code guessed
+        // at a plausible-sounding distributed notification name
+        // ("com.apple.desktopBackgroundChanged"), but that string doesn't
+        // actually exist anywhere in the system frameworks (confirmed via
+        // `strings` on WallpaperAgent/Dock/CoreServices), so it silently
+        // never fired — the cache was never actually invalidating. Watching
+        // WallpaperAgent's own on-disk state file instead is verifiable:
+        // its `LastSet`/`LastUse` timestamps are confirmed (by direct
+        // inspection) to update the moment the wallpaper changes, static or
+        // procedural alike, so a filesystem watcher on it is reliable
+        // regardless of what notification (if any) WallpaperAgent posts.
+        watchWallpaperStore()
+    }
+
+    private func watchWallpaperStore() {
+        let fd = open(Self.wallpaperStorePath, O_EVTONLY)
+        guard fd >= 0 else { return }
+
+        // Plists are typically written via write-to-temp-then-atomic-rename,
+        // which orphans whatever file descriptor was watching the original
+        // path — `.rename`/`.delete` catch that so watching can be
+        // re-established against the new inode, not just `.write` for
+        // in-place modifications.
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.cachedImage = nil
+            self.wallpaperChangeSource?.cancel()
+            self.watchWallpaperStore()
+            if let screen = self.lastPrewarmedScreen {
+                self.prewarm(for: screen)
+            }
         }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        wallpaperChangeSource = source
     }
 
     /// Returns the cached, already-rendered background if one is ready.
@@ -50,6 +85,7 @@ final class WallpaperBackgroundCache {
     /// computation is already in flight. `completion` (if given) fires on
     /// the main actor once a fresh image is ready.
     func prewarm(for screen: NSScreen, completion: (@MainActor (NSImage) -> Void)? = nil) {
+        lastPrewarmedScreen = screen
         guard cachedImage == nil, !isComputing else { return }
         isComputing = true
 

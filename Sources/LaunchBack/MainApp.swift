@@ -92,8 +92,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func show() {
         guard !isVisible, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
 
+        // The exact same closure goes to both the SwiftUI content (tap to
+        // dismiss, onExitCommand) and the window itself (its own Escape-key
+        // monitor) — one authoritative dismissal path no matter which of
+        // them triggers it, so `isVisible`/`overlayWindow` never drift out
+        // of sync with what's actually on screen.
+        let dismissAction: () -> Void = { [weak self] in self?.hide() }
         let window = LaunchpadOverlayWindow(screen: screen)
-        window.show(with: GridView(store: appStore, onDismiss: { [weak self] in self?.hide() }))
+        window.show(with: GridView(store: appStore, onDismiss: dismissAction), onDismiss: dismissAction)
         overlayWindow = window
         isVisible = true
     }

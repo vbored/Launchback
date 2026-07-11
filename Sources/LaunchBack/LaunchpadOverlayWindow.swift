@@ -12,6 +12,7 @@ final class LaunchpadOverlayWindow: NSWindow {
     private var fallbackBlurView: NSVisualEffectView?
     private var hostingView: NSView?
     private let targetFrame: NSRect
+    private var onRequestDismiss: (() -> Void)?
 
     /// A slightly inset, centered version of `targetFrame` — the animation
     /// starts (on show) or ends (on dismiss) here, so the whole overlay
@@ -95,8 +96,20 @@ final class LaunchpadOverlayWindow: NSWindow {
         fallbackBlurView = blurView
     }
 
-    /// Mounts `rootView` into the window and brings it on screen.
-    func show(with rootView: some View) {
+    /// Mounts `rootView` into the window and brings it on screen. `onDismiss`
+    /// is the *same* closure passed to the SwiftUI content for its own
+    /// tap-to-dismiss handling — routing the Escape key through it too
+    /// (rather than this window calling its own `dismiss()` directly) keeps
+    /// whichever object owns this window (e.g. `AppDelegate`, tracking
+    /// visibility state) in sync no matter which path closed the overlay.
+    /// Escape previously called `dismiss()` directly here, which animated
+    /// the window closed perfectly fine but never told `AppDelegate` it had
+    /// happened — leaving it still believing the overlay was visible, so
+    /// the *next* toggle (hotkey, reopen) would try to hide an
+    /// already-hidden window and silently do nothing, looking exactly like
+    /// a hung/unresponsive app.
+    func show(with rootView: some View, onDismiss: @escaping () -> Void) {
+        onRequestDismiss = onDismiss
         let hosting = NSHostingView(rootView: rootView)
         hosting.frame = backgroundContainer.bounds
         hosting.autoresizingMask = [.width, .height]
@@ -134,7 +147,7 @@ final class LaunchpadOverlayWindow: NSWindow {
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return event }
             if event.keyCode == 53 { // Escape
-                self.dismiss()
+                self.onRequestDismiss?()
                 return nil
             }
             return event
@@ -159,6 +172,7 @@ final class LaunchpadOverlayWindow: NSWindow {
             self?.orderOut(nil)
             self?.hostingView?.removeFromSuperview()
             self?.hostingView = nil
+            self?.onRequestDismiss = nil
         })
     }
 
