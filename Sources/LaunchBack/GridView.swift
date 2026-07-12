@@ -90,7 +90,7 @@ struct GridView: View {
                             .background(ScrollbarHider())
                         }
                         .frame(width: contentWidth)
-                        .scrollTargetBehavior(.paging)
+                        .scrollTargetBehavior(QuickPagingBehavior())
                         .scrollPosition(id: $currentPage)
                         .scrollIndicators(.hidden)
                         .scrollDisabled(pages.count <= 1)
@@ -286,6 +286,44 @@ private struct SearchField: View {
         .background(Capsule().fill(.white.opacity(0.14)))
         .overlay(Capsule().stroke(.white.opacity(0.18), lineWidth: 1))
         .onAppear { isFocused.wrappedValue = true }
+    }
+}
+
+/// Apple's stock `.paging` scroll target behavior seems to require a fairly
+/// large drag distance (or a very fast velocity) to commit to changing
+/// pages — fine for a continuous trackpad drag, but a Magic Mouse's swipe
+/// gesture is a short, quick flick rather than a sustained drag, and often
+/// doesn't clear that bar. The result: the swipe registers, but the page
+/// snaps right back to where it started instead of advancing, reading as
+/// "slow to respond" — the first swipe seems to do nothing, and it takes a
+/// second, more deliberate one to actually move. This behavior commits to
+/// the next/previous page on either a smaller drag distance (roughly a
+/// sixth of the page width) *or* a fast-enough flick regardless of distance
+/// travelled, so a short, fast swipe (Magic Mouse) and a longer, slower
+/// drag (trackpad) both reliably change pages on the first try.
+private struct QuickPagingBehavior: ScrollTargetBehavior {
+    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
+        let pageWidth = context.containerSize.width
+        guard pageWidth > 0, context.contentSize.width > pageWidth else { return }
+
+        let originalOffset = context.originalTarget.rect.minX
+        let proposedOffset = target.rect.minX
+        let velocity = context.velocity.dx
+
+        let currentPage = (originalOffset / pageWidth).rounded()
+        var destinationPage = currentPage
+
+        let distanceThreshold = pageWidth / 6
+        let velocityThreshold: CGFloat = 200
+
+        if proposedOffset - originalOffset > distanceThreshold || velocity > velocityThreshold {
+            destinationPage = currentPage + 1
+        } else if originalOffset - proposedOffset > distanceThreshold || velocity < -velocityThreshold {
+            destinationPage = currentPage - 1
+        }
+
+        let maxOffset = context.contentSize.width - pageWidth
+        target.rect.origin.x = min(max(destinationPage * pageWidth, 0), maxOffset)
     }
 }
 

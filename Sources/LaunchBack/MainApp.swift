@@ -33,6 +33,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu-bar-less background utility
 
+        // Apps with no visible windows are eligible for macOS's "Automatic
+        // Termination" — the OS can silently *quit the whole process* to
+        // reclaim memory during a long idle period (confirmed via `log
+        // show`: this process was tagged
+        // `_kLSApplicationWouldBeTerminatedByTALKey=1`, i.e. eligible).
+        // LaunchBack has no visible window almost all the time by design —
+        // it's a background accessory app waiting for a hotkey — so it's
+        // squarely in the category this targets. If macOS kills it,
+        // Launch Services silently relaunches it from scratch the next
+        // time the hotkey/reopen fires, paying the *full* cold-start cost
+        // again (process startup, Spotlight re-gathering apps from zero,
+        // an empty wallpaper cache) — which is exactly what "takes a long
+        // time to show apps after not using it for a while" would look
+        // like from the outside, even though every optimization elsewhere
+        // assumes the already-warmed-up process is still the one
+        // responding. Opting out keeps this one persistent instance alive
+        // and ready regardless of idle time.
+        ProcessInfo.processInfo.disableAutomaticTermination(
+            "Background hotkey listener must stay resident to respond instantly"
+        )
+
         DistributedNotificationCenter.default().addObserver(
             self,
             selector: #selector(handleDistributedToggle),
