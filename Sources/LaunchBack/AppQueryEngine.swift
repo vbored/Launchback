@@ -47,6 +47,13 @@ final class AppQueryEngine {
     private var backgroundActivityToken: NSObjectProtocol?
     private var fallbackTimer: Timer?
 
+    nonisolated private static let cacheURL: URL = {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.bored.launchback", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("apps.json")
+    }()
+
     // Every refresh spawns a `Task` to do the (slow-ish) icon-loading
     // enrichment concurrently with whatever Spotlight notification arrives
     // next. Without tracking and cancelling the previous one, a slower
@@ -55,10 +62,46 @@ final class AppQueryEngine {
     // exactly like the live monitor not working at all.
     private var enrichmentTask: Task<Void, Never>?
 
+    // Spotlight's own `NSMetadataQuery` gather is not instant — a *fresh*
+    // process always starts this from zero, which is exactly what "opening
+    // the app also takes time to load the apps" describes: the grid shows
+    // immediately (that part's already fast), but sits empty for however
+    // long this first gather takes. `hasReceivedLiveResults` lets the
+    // cache-priming path below know whether it's still safe to populate
+    // `store.apps` — once the real gather has answered even once, cached
+    // data is never allowed to overwrite it.
+    private var hasReceivedLiveResults = false
+
     /// Starts the persistent monitor. Call once, at launch; safe to call
     /// again (a no-op) if a monitor is already running.
     func startMonitoring(store: AppStore) {
         guard query == nil else { return }
+
+        // Show last session's app list immediately, before Spotlight has
+        // gathered anything — it's re-verified (icons freshly re-loaded,
+        // not reused from disk) rather than trusted blindly, and gets
+        // replaced the moment the live query actually answers, so a stale
+        // cache (an app installed/removed since last run) only shows
+        // briefly instead of leaving the grid empty the whole time.
+        //
+        // `Task.detached`, not a plain `Task` — a plain `Task` here inherits
+        // this method's `MainActor` context, and profiling (temporary
+        // instrumentation) showed it sitting queued for ~290ms before
+        // actually running: the main run loop was still busy with the
+        // overlay's own open animation at the exact moment this got
+        // scheduled, and a MainActor-bound `Task` has to wait its turn
+        // behind that. None of this work — reading the cache file, loading
+        // icons — needs the main actor at all until the very last step, so
+        // detaching it entirely sidesteps that contention.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let cachedPaths = Self.loadCachedPaths() else { return }
+            let urls = cachedPaths.map { URL(fileURLWithPath: $0) }
+            let infos = await Self.loadAll(urls: urls)
+            await MainActor.run {
+                guard let self, !self.hasReceivedLiveResults, !infos.isEmpty else { return }
+                store.apps = infos
+            }
+        }
 
         // Uses Spotlight's existing index instead of walking the
         // filesystem. A plain recursive directory walk both misses
@@ -106,7 +149,19 @@ final class AppQueryEngine {
             reason: "Keep the Spotlight app monitor live-updating in the background"
         )
 
-        query.start()
+        // `query.start()` itself (not the setup above, which is cheap/no
+        // I/O) is what kicks off Spotlight's actual on-disk gather — and
+        // profiling showed it competing with the cache-priming task above
+        // for disk I/O when both start at once: loading the *same* 126
+        // apps' icons took 86ms in isolation, but 300-700ms when racing
+        // this. A short, deliberate head start lets the cache path — which
+        // is what the user actually sees first — finish largely undisturbed
+        // before Spotlight's heavier gather ramps up. Delaying live results
+        // by a couple hundred milliseconds is imperceptible; racing them
+        // was directly costing the one thing this delay avoids.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            query.start()
+        }
 
         // Belt-and-suspenders re-read on a timer, independent of whether an
         // update notification fires. Cheap — it's just a `resultCount` read
@@ -143,8 +198,23 @@ final class AppQueryEngine {
         enrichmentTask = Task {
             let infos = await Self.loadAll(urls: urls)
             guard !Task.isCancelled else { return }
+            self.hasReceivedLiveResults = true
             store.apps = infos
+            Self.saveCachedPaths(infos.map { $0.bundleURL.path })
         }
+    }
+
+    nonisolated private static func loadCachedPaths() -> [String]? {
+        guard let data = try? Data(contentsOf: cacheURL),
+              let paths = try? JSONDecoder().decode([String].self, from: data),
+              !paths.isEmpty
+        else { return nil }
+        return paths
+    }
+
+    nonisolated private static func saveCachedPaths(_ paths: [String]) {
+        guard let data = try? JSONEncoder().encode(paths) else { return }
+        try? data.write(to: cacheURL, options: .atomic)
     }
 
     private static func loadAll(urls: [URL]) async -> [AppInfo] {
