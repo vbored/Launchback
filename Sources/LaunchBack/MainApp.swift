@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyManager: HotkeyManager?
     private var isVisible = false
     private let appStore = AppStore()
+    private let folderStore = FolderStore()
 
     // Apple's own (now-vestigial) Launchpad.app shim toggles by posting this
     // exact distributed notification — observed via `strings` on
@@ -103,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleDistributedToggle() {
+        DebugTiming.mark("handleDistributedToggle entered")
         toggle()
     }
 
@@ -111,7 +113,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func show() {
+        DebugTiming.mark("AppDelegate.show() entered")
         guard !isVisible, let screen = Self.targetScreen() else { return }
+        DebugTiming.mark("targetScreen resolved")
 
         // The exact same closure goes to both the SwiftUI content (tap to
         // dismiss, onExitCommand) and the window itself (its own Escape-key
@@ -120,7 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // of sync with what's actually on screen.
         let dismissAction: () -> Void = { [weak self] in self?.hide() }
         let window = LaunchpadOverlayWindow(screen: screen)
-        window.show(with: GridView(store: appStore, onDismiss: dismissAction), onDismiss: dismissAction)
+        window.show(with: GridView(store: appStore, folderStore: folderStore, onDismiss: dismissAction), onDismiss: dismissAction)
         overlayWindow = window
         isVisible = true
     }

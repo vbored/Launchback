@@ -6,7 +6,7 @@ import SwiftUI
 /// desktop wallpaper.
 @MainActor
 final class LaunchpadOverlayWindow: NSWindow {
-    private var escMonitor: Any?
+    private var keyMonitor: Any?
     private let backgroundContainer = NSView()
     private var backgroundImageView: NSImageView?
     private var fallbackBlurView: NSVisualEffectView?
@@ -109,15 +109,18 @@ final class LaunchpadOverlayWindow: NSWindow {
     /// already-hidden window and silently do nothing, looking exactly like
     /// a hung/unresponsive app.
     func show(with rootView: some View, onDismiss: @escaping () -> Void) {
+        DebugTiming.mark("LaunchpadOverlayWindow.show(with:) entered")
         onRequestDismiss = onDismiss
         let hosting = NSHostingView(rootView: rootView)
         hosting.frame = backgroundContainer.bounds
         hosting.autoresizingMask = [.width, .height]
         backgroundContainer.addSubview(hosting)
         hostingView = hosting
+        DebugTiming.mark("hosting view mounted")
 
         alphaValue = 0
         setFrame(zoomedOutFrame, display: false)
+        DebugTiming.mark("after setFrame(zoomedOutFrame)")
         // `activate(ignoringOtherApps:)` is asynchronous, so even calling
         // it before ordering the window doesn't reliably win the race:
         // `makeKeyAndOrderFront` can still run before LaunchBack is
@@ -130,7 +133,9 @@ final class LaunchpadOverlayWindow: NSWindow {
         // window to the front of its level regardless of app activation
         // state, so use that instead of `makeKeyAndOrderFront`.
         NSApp.activate(ignoringOtherApps: true)
+        DebugTiming.mark("after NSApp.activate")
         orderFrontRegardless()
+        DebugTiming.mark("after orderFrontRegardless")
         makeKey()
 
         // Classic Launchpad hides the Dock outright while active instead of
@@ -144,10 +149,22 @@ final class LaunchpadOverlayWindow: NSWindow {
             animator().setFrame(targetFrame, display: true)
         }
 
-        escMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return event }
             if event.keyCode == 53 { // Escape
                 self.onRequestDismiss?()
+                return nil
+            }
+            // LaunchBack has no Dock icon and no menu bar (`.accessory`
+            // activation policy, by design — it's meant to be invisible
+            // until summoned), so there's normally no "Quit" anywhere a
+            // user could find without opening Activity Monitor. `⌘Q` is the
+            // one quit gesture every Mac user already knows regardless of
+            // whether there's a menu to trigger it from, so honor it
+            // directly while the grid is open — the one moment the app has
+            // any UI at all to be listening from.
+            if event.keyCode == 12, event.modifierFlags.contains(.command) { // ⌘Q
+                NSApp.terminate(nil)
                 return nil
             }
             return event
@@ -156,9 +173,9 @@ final class LaunchpadOverlayWindow: NSWindow {
 
     /// Fades out, tears down the hosted content, and orders the window out.
     func dismiss() {
-        if let escMonitor {
-            NSEvent.removeMonitor(escMonitor)
-            self.escMonitor = nil
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
         }
 
         NSApp.presentationOptions.remove(.hideDock)

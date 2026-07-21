@@ -1,5 +1,28 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// Either a plain app or a folder of apps, as shown in the grid — lets
+/// `pages` mix the two the same way classic Launchpad does, sorted together
+/// by display name.
+private enum LaunchItem: Identifiable, Hashable {
+    case app(AppInfo)
+    case folder(AppFolder)
+
+    var id: String {
+        switch self {
+        case .app(let app): return app.id
+        case .folder(let folder): return "folder:\(folder.id.uuidString)"
+        }
+    }
+
+    var sortName: String {
+        switch self {
+        case .app(let app): return app.name
+        case .folder(let folder): return folder.name
+        }
+    }
+}
 
 /// Full-screen, paginated app grid. `TabView`'s `.page` style is iOS-only,
 /// so paging is built from a horizontal `ScrollView` with native
@@ -8,6 +31,7 @@ import SwiftUI
 /// Launchpad page indicator, and a top search field live-filters the grid.
 struct GridView: View {
     @ObservedObject var store: AppStore
+    @ObservedObject var folderStore: FolderStore
     let onDismiss: () -> Void
 
     @State private var currentPage: Int?
@@ -16,14 +40,20 @@ struct GridView: View {
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
 
+    // The folder currently open in the detail overlay, if any. Looked up
+    // live from `folderStore.folders` by id wherever it's needed (rather
+    // than held as a snapshot) so removing/adding apps while the folder is
+    // open updates it immediately instead of showing stale contents.
+    @State private var openFolderID: UUID?
+
     // `pages` used to be a computed property, re-filtering and re-chunking
     // the entire app list on *every* SwiftUI body evaluation — which fires
     // on every hover event and every scroll-position tick while paging.
     // Redoing that work dozens of times a second while swiping was the
     // actual cause of the slow/glitchy transitions: recomputed here once,
-    // only when the underlying data (`store.apps`, `searchText`) actually
-    // changes, instead of on every render.
-    @State private var pages: [[AppInfo]] = []
+    // only when the underlying data (`store.apps`, `searchText`,
+    // `folderStore.folders`) actually changes, instead of on every render.
+    @State private var pages: [[LaunchItem]] = []
 
     private let columns = 7
     private let rows = 5
@@ -138,15 +168,46 @@ struct GridView: View {
                     .frame(maxWidth: .infinity)
                 }
             }
+
+            // Drawn above the grid, its own scrim intercepting taps so the
+            // grid underneath doesn't also react to them. Kept as a
+            // sibling in this outer ZStack (rather than nested inside the
+            // GeometryReader above) so it's sized to the whole overlay, not
+            // just the 68%-wide framed content area.
+            if let folderID = openFolderID, let folder = folderStore.folders.first(where: { $0.id == folderID }) {
+                FolderDetailView(
+                    folder: folder,
+                    apps: apps(in: folder),
+                    launchingID: launchingID,
+                    onLaunch: { launch($0) },
+                    onRemove: { appID in
+                        folderStore.removeApp(appID)
+                        recomputePages()
+                    },
+                    onRename: { newName in folderStore.rename(folder.id, to: newName) },
+                    onClose: { openFolderID = nil }
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                .zIndex(10)
+            }
         }
-        .onAppear { recomputePages() }
-        .onChange(of: store.apps) { recomputePages() }
+        .onAppear {
+            folderStore.seedUtilitiesFolderIfNeeded(from: store.apps)
+            recomputePages()
+        }
+        .onChange(of: store.apps) {
+            folderStore.seedUtilitiesFolderIfNeeded(from: store.apps)
+            recomputePages()
+        }
+        .onChange(of: folderStore.folders) { recomputePages() }
         .onChange(of: searchText) {
             currentPage = 0
             recomputePages()
         }
         .onExitCommand {
-            if !searchText.isEmpty {
+            if openFolderID != nil {
+                openFolderID = nil
+            } else if !searchText.isEmpty {
                 searchText = ""
             } else {
                 onDismiss()
@@ -154,13 +215,45 @@ struct GridView: View {
         }
     }
 
+    /// Resolves a folder's stored app identifiers against the live app
+    /// list, in the folder's own stored order. An identifier whose app was
+    /// since uninstalled simply drops out (no explicit cleanup needed —
+    /// `FolderStore` doesn't know or care about apps it's never told to
+    /// remove).
+    private func apps(in folder: AppFolder) -> [AppInfo] {
+        let byID = Dictionary(uniqueKeysWithValues: store.apps.map { ($0.id, $0) })
+        return folder.appIDs.compactMap { byID[$0] }
+    }
+
     private func recomputePages() {
-        let filtered = searchText.isEmpty
-            ? store.apps
-            : store.apps.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
         let perPage = max(columns * rows, 1)
-        let newPages = stride(from: 0, to: filtered.count, by: perPage).map {
-            Array(filtered[$0..<min($0 + perPage, filtered.count)])
+        let newPages: [[LaunchItem]]
+
+        if searchText.isEmpty {
+            // Top level shows every app not currently tucked inside a
+            // folder, plus one icon per folder, sorted together by name —
+            // matching classic Launchpad's alphabetical-with-folders-mixed-in
+            // layout rather than pinning folders to a fixed position.
+            let folderedIDs = Set(folderStore.folders.flatMap { $0.appIDs })
+            var items: [LaunchItem] = store.apps
+                .filter { !folderedIDs.contains($0.id) }
+                .map { .app($0) }
+            items += folderStore.folders.map { .folder($0) }
+            items.sort { $0.sortName.localizedStandardCompare($1.sortName) == .orderedAscending }
+            newPages = stride(from: 0, to: items.count, by: perPage).map {
+                Array(items[$0..<min($0 + perPage, items.count)])
+            }
+        } else {
+            // While searching, match against every app regardless of
+            // folder membership — including apps tucked inside a folder,
+            // since the whole point of search is not needing to remember
+            // which folder something's in — and show them flat.
+            let matches = store.apps
+                .filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+                .map { LaunchItem.app($0) }
+            newPages = stride(from: 0, to: matches.count, by: perPage).map {
+                Array(matches[$0..<min($0 + perPage, matches.count)])
+            }
         }
         // The live app-list monitor can update `store.apps` several times in
         // quick succession while it's still settling (initial gather, then
@@ -187,7 +280,7 @@ struct GridView: View {
     /// own, so adjacent pages sit flush against each other with no gap
     /// during a swipe.
     @ViewBuilder
-    private func pageGrid(_ pageApps: [AppInfo], containerWidth: CGFloat, containerHeight: CGFloat) -> some View {
+    private func pageGrid(_ pageItems: [LaunchItem], containerWidth: CGFloat, containerHeight: CGFloat) -> some View {
         let horizontalSpacing: CGFloat = 32
         let cellWidth = (containerWidth - horizontalSpacing * CGFloat(columns - 1)) / CGFloat(columns)
         // 0.45 undershot next to the reference once rendered — bumped to
@@ -223,22 +316,83 @@ struct GridView: View {
             columns: Array(repeating: GridItem(.flexible(), spacing: horizontalSpacing), count: columns),
             spacing: verticalSpacing
         ) {
-            ForEach(pageApps) { app in
-                AppIconView(
-                    app: app,
-                    iconSize: iconSize,
-                    labelWidth: cellWidth,
-                    isHovered: hoveredID == app.id,
-                    isLaunching: launchingID == app.id
-                )
-                .onHover { hoveredID = $0 ? app.id : nil }
-                .onTapGesture { launch(app) }
+            ForEach(pageItems) { item in
+                Group {
+                    switch item {
+                    case .app(let app):
+                        AppIconView(
+                            app: app,
+                            iconSize: iconSize,
+                            labelWidth: cellWidth,
+                            isHovered: hoveredID == app.id,
+                            isLaunching: launchingID == app.id
+                        )
+                        .onHover { hoveredID = $0 ? app.id : nil }
+                        .onTapGesture { launch(app) }
+                        // Only loose apps are draggable — dragging an
+                        // existing folder isn't supported (reordering
+                        // folders isn't the ask here; grouping apps is).
+                        // The payload is just the bundle identifier as
+                        // plain text, read back out in `handleDrop`.
+                        .onDrag { NSItemProvider(object: app.id as NSString) }
+                    case .folder(let folder):
+                        FolderIconView(
+                            folder: folder,
+                            previewApps: apps(in: folder),
+                            iconSize: iconSize,
+                            labelWidth: cellWidth,
+                            isHovered: hoveredID == item.id
+                        )
+                        .onHover { hoveredID = $0 ? item.id : nil }
+                        .onTapGesture { openFolderID = folder.id }
+                    }
+                }
+                // Every icon — app or folder — is a valid drop target: an
+                // app dropped on another app spins up a new folder, an app
+                // dropped on a folder joins it.
+                .onDrop(of: [.text], isTargeted: nil) { providers in
+                    handleDrop(providers: providers, onto: item)
+                }
             }
         }
         .padding(.top, topInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .contentShape(Rectangle())
         .onTapGesture(perform: onDismiss)
+    }
+
+    /// Reads the dragged app's identifier back out of the drop's
+    /// `NSItemProvider` and, once resolved, either folds it into an
+    /// existing folder or spins up a brand new one — classic Launchpad's
+    /// "drag one app onto another" gesture. Returns `true` immediately (to
+    /// accept the drop visually); the actual mutation happens
+    /// asynchronously once the identifier finishes loading.
+    private func handleDrop(providers: [NSItemProvider], onto target: LaunchItem) -> Bool {
+        guard let provider = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else {
+            return false
+        }
+        provider.loadObject(ofClass: NSString.self) { reading, _ in
+            guard let draggedID = reading as? String else { return }
+            Task { @MainActor in
+                performDrop(draggedID: draggedID, target: target)
+            }
+        }
+        return true
+    }
+
+    private func performDrop(draggedID: String, target: LaunchItem) {
+        switch target {
+        case .app(let targetApp):
+            guard draggedID != targetApp.id else { return }
+            withAnimation(Self.pageChangeAnimation) {
+                folderStore.createFolder(combining: draggedID, with: targetApp.id, defaultName: "New Folder")
+            }
+        case .folder(let targetFolder):
+            guard !targetFolder.appIDs.contains(draggedID) else { return }
+            withAnimation(Self.pageChangeAnimation) {
+                folderStore.moveApp(draggedID, intoFolder: targetFolder.id)
+            }
+        }
     }
 
     private func launch(_ app: AppInfo) {
@@ -461,3 +615,144 @@ private struct AppIconView: View {
         .contentShape(Rectangle())
     }
 }
+
+/// A folder's grid icon: a translucent rounded "tray" holding up to 9 of
+/// its apps' actual icons in a mini 3x3 preview, the same idea as classic
+/// Launchpad's folder stack.
+private struct FolderIconView: View {
+    let folder: AppFolder
+    let previewApps: [AppInfo]
+    let iconSize: CGFloat
+    let labelWidth: CGFloat
+    let isHovered: Bool
+
+    var body: some View {
+        VStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: iconSize * 0.22, style: .continuous)
+                .fill(.white.opacity(0.16))
+                .overlay(
+                    RoundedRectangle(cornerRadius: iconSize * 0.22, style: .continuous)
+                        .stroke(.white.opacity(0.22), lineWidth: 1)
+                )
+                .overlay(miniGrid.padding(iconSize * 0.13))
+                .frame(width: iconSize, height: iconSize)
+                .scaleEffect(isHovered ? 1.08 : 1.0)
+                .animation(.spring(response: 0.28, dampingFraction: 0.6), value: isHovered)
+
+            Text(folder.name)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: labelWidth)
+                .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
+        }
+        .contentShape(Rectangle())
+    }
+
+    private var miniGrid: some View {
+        let shown = Array(previewApps.prefix(9))
+        let miniColumns = Array(repeating: GridItem(.flexible(), spacing: 3), count: 3)
+        return LazyVGrid(columns: miniColumns, spacing: 3) {
+            ForEach(shown) { app in
+                Image(nsImage: app.icon)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+        }
+    }
+}
+
+/// The expanded, centered panel shown when a folder is tapped — its own
+/// scrim behind it closes just the folder (not the whole overlay) on tap,
+/// mirroring classic Launchpad's folder-open behavior. The folder's name is
+/// directly editable; hovering an app inside reveals a small remove button
+/// that drops it back to the top-level grid.
+private struct FolderDetailView: View {
+    let folder: AppFolder
+    let apps: [AppInfo]
+    let launchingID: String?
+    let onLaunch: (AppInfo) -> Void
+    let onRemove: (String) -> Void
+    let onRename: (String) -> Void
+    let onClose: () -> Void
+
+    @State private var nameText: String = ""
+    @FocusState private var nameFocused: Bool
+    @State private var hoveredID: String?
+
+    private let columns = 5
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.35)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onClose)
+
+            VStack(spacing: 20) {
+                TextField("Folder Name", text: $nameText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .focused($nameFocused)
+                    .onSubmit { nameFocused = false }
+                    .frame(maxWidth: 320)
+
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 24), count: columns),
+                    spacing: 24
+                ) {
+                    ForEach(apps) { app in
+                        ZStack(alignment: .topLeading) {
+                            AppIconView(
+                                app: app,
+                                iconSize: 76,
+                                labelWidth: 92,
+                                isHovered: hoveredID == app.id,
+                                isLaunching: launchingID == app.id
+                            )
+                            .onHover { hoveredID = $0 ? app.id : nil }
+                            .onTapGesture { onLaunch(app) }
+
+                            if hoveredID == app.id {
+                                Button {
+                                    hoveredID = nil
+                                    onRemove(app.id)
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .symbolRenderingMode(.palette)
+                                        .foregroundStyle(.white, .black.opacity(0.55))
+                                        .font(.system(size: 17))
+                                }
+                                .buttonStyle(.plain)
+                                .offset(x: -6, y: -6)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: 520)
+            }
+            .padding(36)
+            .background(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, .dark)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .stroke(.white.opacity(0.15), lineWidth: 1)
+            )
+            .frame(maxWidth: 600)
+        }
+        .onAppear { nameText = folder.name }
+        // Fires on every route out of the folder — background tap, Escape
+        // (handled up in `GridView.onExitCommand`, which just clears
+        // `openFolderID` and lets this view disappear), or opening a
+        // different folder — so a typed rename is never silently lost
+        // regardless of how the panel closed.
+        .onDisappear { onRename(nameText) }
+    }
+}
+
