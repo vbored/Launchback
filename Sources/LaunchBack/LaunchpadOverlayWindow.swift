@@ -14,6 +14,18 @@ final class LaunchpadOverlayWindow: NSWindow {
     private let targetFrame: NSRect
     private var onRequestDismiss: (() -> Void)?
 
+    // Bumped on every `show()`/`dismiss()` call and captured by `dismiss()`'s
+    // animation completion handler. Reusing one window instance across
+    // toggles (rather than a fresh window per toggle) means a fast
+    // close-then-reopen can call `show()` again before the *previous*
+    // `dismiss()`'s ~0.18s fade-out animation has finished — without this
+    // check, that old completion handler would still fire afterward and
+    // tear down state the new `show()` had already re-armed (wiping out
+    // its `onRequestDismiss`, ripping its freshly-mounted hosting view back
+    // out from under it). Comparing against the current token lets a
+    // completion handler recognize it's stale and simply no-op.
+    private var operationToken = 0
+
     /// A slightly inset, centered version of `targetFrame` — the animation
     /// starts (on show) or ends (on dismiss) here, so the whole overlay
     /// gently grows into place / shrinks away instead of just cross-fading,
@@ -110,7 +122,15 @@ final class LaunchpadOverlayWindow: NSWindow {
     /// a hung/unresponsive app.
     func show(with rootView: some View, onDismiss: @escaping () -> Void) {
         DebugTiming.mark("LaunchpadOverlayWindow.show(with:) entered")
+        operationToken += 1
         onRequestDismiss = onDismiss
+        // Defensive: if a previous `dismiss()`'s fade-out animation hasn't
+        // finished yet (fast close-then-reopen), its hosting view is still
+        // attached — the `operationToken` check in `dismiss()`'s completion
+        // handler will skip *its* cleanup once this newer `show()` has run,
+        // so without this, that old view would linger under the new one
+        // indefinitely rather than just for the remainder of the fade.
+        hostingView?.removeFromSuperview()
         let hosting = NSHostingView(rootView: rootView)
         hosting.frame = backgroundContainer.bounds
         hosting.autoresizingMask = [.width, .height]
@@ -180,19 +200,41 @@ final class LaunchpadOverlayWindow: NSWindow {
 
         NSApp.presentationOptions.remove(.hideDock)
 
+        operationToken += 1
+        let token = operationToken
+
         NSAnimationContext.runAnimationGroup({ [zoomedOutFrame] context in
             context.duration = 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             animator().alphaValue = 0
             animator().setFrame(zoomedOutFrame, display: true)
         }, completionHandler: { [weak self] in
-            self?.orderOut(nil)
-            self?.hostingView?.removeFromSuperview()
-            self?.hostingView = nil
-            self?.onRequestDismiss = nil
+            // If a newer `show()` (or another `dismiss()`) has run since
+            // this one started, this completion is stale — the window is
+            // back on screen with fresh state, and tearing anything down
+            // now would rip that out from under it instead of cleaning up
+            // this call's own leftovers.
+            guard let self, self.operationToken == token else { return }
+            self.orderOut(nil)
+            self.hostingView?.removeFromSuperview()
+            self.hostingView = nil
+            self.onRequestDismiss = nil
         })
     }
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    /// Whether this window is already sized for `screen` and can be shown
+    /// again as-is. Used by `AppDelegate` to reuse the same window instance
+    /// across toggles rather than tearing down and reallocating a
+    /// full-screen buffered `NSWindow` (plus its background container and
+    /// wallpaper image view) on every single open — real, measurable
+    /// overhead that a fresh `LaunchpadOverlayWindow` used to pay on every
+    /// toggle even though almost all of it (the window itself, the cached
+    /// wallpaper backing) never actually changes between opens on the same
+    /// screen.
+    func matches(screen: NSScreen) -> Bool {
+        screen.frame == targetFrame
+    }
 }

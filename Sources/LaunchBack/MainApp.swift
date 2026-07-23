@@ -123,15 +123,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // them triggers it, so `isVisible`/`overlayWindow` never drift out
         // of sync with what's actually on screen.
         let dismissAction: () -> Void = { [weak self] in self?.hide() }
-        let window = LaunchpadOverlayWindow(screen: screen)
+
+        // Reusing the same `LaunchpadOverlayWindow` instance across toggles
+        // (rather than allocating a brand new full-screen buffered
+        // `NSWindow` every single time) is what actually made toggle-open
+        // feel slow: window allocation isn't free, and it was happening on
+        // every hotkey press even though almost nothing about the window
+        // itself — its frame, its background container, its cached
+        // wallpaper image — ever changes between opens on the same screen.
+        // Only when the target screen genuinely changes (moved the mouse
+        // to a different display since the last open) does a fresh window
+        // sized for it get built.
+        let window: LaunchpadOverlayWindow
+        if let existing = overlayWindow, existing.matches(screen: screen) {
+            window = existing
+        } else {
+            window = LaunchpadOverlayWindow(screen: screen)
+            overlayWindow = window
+        }
         window.show(with: GridView(store: appStore, folderStore: folderStore, onDismiss: dismissAction), onDismiss: dismissAction)
-        overlayWindow = window
         isVisible = true
     }
 
     private func hide() {
+        // The window itself is left alive and simply ordered out/faded by
+        // `dismiss()` — not discarded — so the next `show()` can reuse it
+        // instead of paying for a fresh `NSWindow` allocation. See the
+        // comment in `show()`.
         overlayWindow?.dismiss()
-        overlayWindow = nil
         isVisible = false
     }
 

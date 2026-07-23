@@ -46,6 +46,13 @@ struct GridView: View {
     // open updates it immediately instead of showing stale contents.
     @State private var openFolderID: UUID?
 
+    // Captured from the grid's own `GeometryReader` so the folder-detail
+    // overlay (a ZStack sibling, outside that GeometryReader) can size its
+    // icons and panel proportionally to the same screen instead of using
+    // fixed point values — a fixed size looked fine on the screen it was
+    // eyeballed against and comically small on a larger display.
+    @State private var gridContainerSize: CGSize = .zero
+
     // `pages` used to be a computed property, re-filtering and re-chunking
     // the entire app list on *every* SwiftUI body evaluation — which fires
     // on every hover event and every scroll-position tick while paging.
@@ -66,6 +73,21 @@ struct GridView: View {
     // triggered programmatically (mouse-drag release, page-dot tap) keeps
     // every path feeling consistent and fast.
     fileprivate static let pageChangeAnimation: Animation = .easeOut(duration: 0.28)
+
+    /// Column width and icon size for a grid laid out across `contentWidth`
+    /// with `columns` columns — the exact formula the main paged grid uses,
+    /// pulled out so the folder-detail overlay can compute the identical
+    /// icon size for the same screen instead of a separately-tuned
+    /// constant that only happened to look right on one reference display.
+    private static func mainGridMetrics(contentWidth: CGFloat, columns: Int) -> (cellWidth: CGFloat, iconSize: CGFloat) {
+        let horizontalSpacing: CGFloat = 32
+        let cellWidth = (contentWidth - horizontalSpacing * CGFloat(columns - 1)) / CGFloat(columns)
+        // 0.45 undershot next to the reference once rendered — bumped to
+        // 0.55, with the cap raised to match so it doesn't get clipped back
+        // down on typical screen widths.
+        let iconSize = min(max(cellWidth * 0.55, 64), 140)
+        return (cellWidth, iconSize)
+    }
 
     var body: some View {
         ZStack {
@@ -166,6 +188,8 @@ struct GridView: View {
                     // filling and centering within the GeometryReader's full
                     // width restores the centered, framed look.
                     .frame(maxWidth: .infinity)
+                    .onAppear { gridContainerSize = geo.size }
+                    .onChange(of: geo.size) { gridContainerSize = geo.size }
                 }
             }
 
@@ -175,9 +199,14 @@ struct GridView: View {
             // GeometryReader above) so it's sized to the whole overlay, not
             // just the 68%-wide framed content area.
             if let folderID = openFolderID, let folder = folderStore.folders.first(where: { $0.id == folderID }) {
+                let (_, folderIconSize) = Self.mainGridMetrics(
+                    contentWidth: gridContainerSize.width * 0.68,
+                    columns: columns
+                )
                 FolderDetailView(
                     folder: folder,
                     apps: apps(in: folder),
+                    iconSize: folderIconSize,
                     launchingID: launchingID,
                     onLaunch: { launch($0) },
                     onRemove: { appID in
@@ -192,10 +221,12 @@ struct GridView: View {
             }
         }
         .onAppear {
+            appsByID = Dictionary(uniqueKeysWithValues: store.apps.map { ($0.id, $0) })
             folderStore.seedUtilitiesFolderIfNeeded(from: store.apps)
             recomputePages()
         }
         .onChange(of: store.apps) {
+            appsByID = Dictionary(uniqueKeysWithValues: store.apps.map { ($0.id, $0) })
             folderStore.seedUtilitiesFolderIfNeeded(from: store.apps)
             recomputePages()
         }
@@ -215,14 +246,22 @@ struct GridView: View {
         }
     }
 
+    /// Rebuilt only when `store.apps` itself changes (not on every folder
+    /// edit or search keystroke) and reused by `apps(in:)` — building this
+    /// fresh on every call was the actual cost: `apps(in:)` runs once per
+    /// *folder icon rendered*, so on a grid with several folders spread
+    /// across pages, the naive version was rebuilding an O(n) dictionary
+    /// out of the entire app list several times over on every single
+    /// render pass.
+    @State private var appsByID: [String: AppInfo] = [:]
+
     /// Resolves a folder's stored app identifiers against the live app
     /// list, in the folder's own stored order. An identifier whose app was
     /// since uninstalled simply drops out (no explicit cleanup needed —
     /// `FolderStore` doesn't know or care about apps it's never told to
     /// remove).
     private func apps(in folder: AppFolder) -> [AppInfo] {
-        let byID = Dictionary(uniqueKeysWithValues: store.apps.map { ($0.id, $0) })
-        return folder.appIDs.compactMap { byID[$0] }
+        folder.appIDs.compactMap { appsByID[$0] }
     }
 
     private func recomputePages() {
@@ -234,12 +273,38 @@ struct GridView: View {
             // folder, plus one icon per folder, sorted together by name —
             // matching classic Launchpad's alphabetical-with-folders-mixed-in
             // layout rather than pinning folders to a fixed position.
+            //
+            // `store.apps` already arrives sorted by name (see
+            // `AppQueryEngine.loadAll`), and filtering preserves that order
+            // — so re-sorting the whole (often 100+ item) app list here on
+            // every recompute was pure waste; a locale-aware string compare
+            // per element adds up on the main thread and was making every
+            // app-list refresh and folder edit feel a beat slower than it
+            // needed to. Folders are typically a handful at most, so only
+            // sorting *them* and then doing an O(n) merge against the
+            // already-sorted apps gets the identical interleaved order for
+            // a fraction of the cost.
             let folderedIDs = Set(folderStore.folders.flatMap { $0.appIDs })
-            var items: [LaunchItem] = store.apps
+            let topApps: [LaunchItem] = store.apps
                 .filter { !folderedIDs.contains($0.id) }
                 .map { .app($0) }
-            items += folderStore.folders.map { .folder($0) }
-            items.sort { $0.sortName.localizedStandardCompare($1.sortName) == .orderedAscending }
+            let folderItems: [LaunchItem] = folderStore.folders
+                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                .map { .folder($0) }
+
+            var items: [LaunchItem] = []
+            items.reserveCapacity(topApps.count + folderItems.count)
+            var i = 0, j = 0
+            while i < topApps.count, j < folderItems.count {
+                if topApps[i].sortName.localizedStandardCompare(folderItems[j].sortName) != .orderedDescending {
+                    items.append(topApps[i]); i += 1
+                } else {
+                    items.append(folderItems[j]); j += 1
+                }
+            }
+            items.append(contentsOf: topApps[i...])
+            items.append(contentsOf: folderItems[j...])
+
             newPages = stride(from: 0, to: items.count, by: perPage).map {
                 Array(items[$0..<min($0 + perPage, items.count)])
             }
@@ -282,11 +347,7 @@ struct GridView: View {
     @ViewBuilder
     private func pageGrid(_ pageItems: [LaunchItem], containerWidth: CGFloat, containerHeight: CGFloat) -> some View {
         let horizontalSpacing: CGFloat = 32
-        let cellWidth = (containerWidth - horizontalSpacing * CGFloat(columns - 1)) / CGFloat(columns)
-        // 0.45 undershot next to the reference once rendered — bumped to
-        // 0.55, with the cap raised to match so it doesn't get clipped back
-        // down on typical screen widths.
-        let iconSize = min(max(cellWidth * 0.55, 64), 140)
+        let (cellWidth, iconSize) = Self.mainGridMetrics(contentWidth: containerWidth, columns: columns)
 
         // Row spacing was a fixed 32pt regardless of available height, so 5
         // rows never filled the space — everything stayed top-aligned with
@@ -385,7 +446,7 @@ struct GridView: View {
         case .app(let targetApp):
             guard draggedID != targetApp.id else { return }
             withAnimation(Self.pageChangeAnimation) {
-                folderStore.createFolder(combining: draggedID, with: targetApp.id, defaultName: "New Folder")
+                _ = folderStore.createFolder(combining: draggedID, with: targetApp.id, defaultName: "New Folder")
             }
         case .folder(let targetFolder):
             guard !targetFolder.appIDs.contains(draggedID) else { return }
@@ -671,6 +732,7 @@ private struct FolderIconView: View {
 private struct FolderDetailView: View {
     let folder: AppFolder
     let apps: [AppInfo]
+    let iconSize: CGFloat
     let launchingID: String?
     let onLaunch: (AppInfo) -> Void
     let onRemove: (String) -> Void
@@ -681,7 +743,21 @@ private struct FolderDetailView: View {
     @FocusState private var nameFocused: Bool
     @State private var hoveredID: String?
 
+    // Fixed column count (classic Launchpad also wraps folders at a fixed
+    // width rather than reflowing by icon count), but every other
+    // dimension below scales off `iconSize` — which itself matches the
+    // main grid's own icon size for this screen — so the panel comes out
+    // proportional to the display instead of a constant that was only
+    // ever sized against one reference screenshot.
     private let columns = 5
+    private var gridSpacing: CGFloat { iconSize * 0.3 }
+    private var labelWidth: CGFloat { iconSize * 1.2 }
+    private var panelPadding: CGFloat { iconSize * 0.4 }
+    private var titleFontSize: CGFloat { max(20, iconSize * 0.22) }
+    private var removeButtonFontSize: CGFloat { max(15, iconSize * 0.16) }
+    private var panelMaxWidth: CGFloat {
+        CGFloat(columns) * iconSize + CGFloat(columns - 1) * gridSpacing + panelPadding * 2
+    }
 
     var body: some View {
         ZStack {
@@ -690,26 +766,26 @@ private struct FolderDetailView: View {
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onClose)
 
-            VStack(spacing: 20) {
+            VStack(spacing: panelPadding * 0.55) {
                 TextField("Folder Name", text: $nameText)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 20, weight: .semibold))
+                    .font(.system(size: titleFontSize, weight: .semibold))
                     .foregroundStyle(.white)
                     .multilineTextAlignment(.center)
                     .focused($nameFocused)
                     .onSubmit { nameFocused = false }
-                    .frame(maxWidth: 320)
+                    .frame(maxWidth: panelMaxWidth * 0.6)
 
                 LazyVGrid(
-                    columns: Array(repeating: GridItem(.flexible(), spacing: 24), count: columns),
-                    spacing: 24
+                    columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns),
+                    spacing: gridSpacing
                 ) {
                     ForEach(apps) { app in
                         ZStack(alignment: .topLeading) {
                             AppIconView(
                                 app: app,
-                                iconSize: 76,
-                                labelWidth: 92,
+                                iconSize: iconSize,
+                                labelWidth: labelWidth,
                                 isHovered: hoveredID == app.id,
                                 isLaunching: launchingID == app.id
                             )
@@ -724,7 +800,7 @@ private struct FolderDetailView: View {
                                     Image(systemName: "minus.circle.fill")
                                         .symbolRenderingMode(.palette)
                                         .foregroundStyle(.white, .black.opacity(0.55))
-                                        .font(.system(size: 17))
+                                        .font(.system(size: removeButtonFontSize))
                                 }
                                 .buttonStyle(.plain)
                                 .offset(x: -6, y: -6)
@@ -732,9 +808,8 @@ private struct FolderDetailView: View {
                         }
                     }
                 }
-                .frame(maxWidth: 520)
             }
-            .padding(36)
+            .padding(panelPadding)
             .background(
                 RoundedRectangle(cornerRadius: 26, style: .continuous)
                     .fill(.ultraThinMaterial)
@@ -744,7 +819,7 @@ private struct FolderDetailView: View {
                 RoundedRectangle(cornerRadius: 26, style: .continuous)
                     .stroke(.white.opacity(0.15), lineWidth: 1)
             )
-            .frame(maxWidth: 600)
+            .frame(maxWidth: panelMaxWidth)
         }
         .onAppear { nameText = folder.name }
         // Fires on every route out of the folder — background tap, Escape
